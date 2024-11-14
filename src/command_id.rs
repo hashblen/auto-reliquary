@@ -1,2 +1,0 @@
-pub const PLAYER_GET_TOKEN_SC_RSP: u16 = 77;
-pub const GET_QUEST_DATA_SC_RSP: u16 = 971;

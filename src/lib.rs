@@ -20,7 +20,7 @@
 //!
 //! ## Example
 //! ```
-//! use reliquary::network::{GamePacket, GameSniffer, ConnectionPacket};
+//! use auto_reliquary::{GamePacket, GameSniffer, ConnectionPacket};
 //!
 //! let packets: Vec<Vec<u8>> = vec![/**/];
 //!
@@ -33,7 +33,7 @@
 //!         }
 //!         Some(GamePacket::Commands(commands)) => {
 //!             for command in commands {
-//!                 println!("{:?}", command.get_command_name());
+//!                 println!("{:?}", command);
 //!             }
 //!         }
 //!         _ => {}
@@ -52,8 +52,9 @@ use tracing::{info, info_span, instrument, trace, warn};
 
 use crate::connection::parse_connection_packet;
 use crate::crypto::{decrypt_command, lookup_initial_key, new_key_from_seed};
-use crate::gen::protos::PlayerGetTokenScRsp;
+// use crate::gen::protos::PlayerGetTokenScRsp;
 use crate::kcp::KcpSniffer;
+use crate::unk_utils::{Achievement, matches_get_quest_data_sc_rsp, matches_player_get_token_sc_rsp};
 
 fn bytes_as_hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut output, b| {
@@ -62,12 +63,12 @@ fn bytes_as_hex(bytes: &[u8]) -> String {
     })
 }
 
-pub mod command_id;
 pub mod gen;
 
 mod connection;
 mod crypto;
 mod kcp;
+mod unk_utils;
 
 const PORTS: [u16; 2] = [23301, 23302];
 
@@ -156,11 +157,16 @@ pub enum PacketDirection {
     Received,
 }
 
+pub enum Key {
+    Dispatch(Vec<u8>),
+    Session(Vec<u8>),
+}
+
 #[derive(Default)]
 pub struct GameSniffer {
     sent_kcp: Option<KcpSniffer>,
     recv_kcp: Option<KcpSniffer>,
-    key: Option<Vec<u8>>,
+    key: Option<Key>,
     initial_keys: HashMap<u32, Vec<u8>>,
 }
 
@@ -186,6 +192,7 @@ impl GameSniffer {
                 Some(GamePacket::Connection(packet))
             }
             ConnectionPacket::HandshakeEstablished | ConnectionPacket::Disconnected => {
+                self.key = None;
                 Some(GamePacket::Connection(packet))
             }
 
@@ -234,12 +241,15 @@ impl GameSniffer {
         let key = match &self.key {
             Some(k) => k,
             None => {
-                self.key = Some(lookup_initial_key(&self.initial_keys, &data));
+                self.key = Some(Key::Dispatch(lookup_initial_key(&self.initial_keys, &data)));
                 self.key.as_ref().unwrap()
             }
         };
+        let key_bytes = match key {
+            Key::Dispatch(k) | Key::Session(k) => k,
+        };
 
-        decrypt_command(key, &mut data);
+        decrypt_command(key_bytes, &mut data);
 
         let command = GameCommand::try_new(data)?;
 
@@ -249,20 +259,24 @@ impl GameSniffer {
         info!("received");
         trace!(data = BASE64_STANDARD.encode(&command.proto_data), "data");
 
-        if !matches!(
-            command.command_id,
-            command_id::PLAYER_GET_TOKEN_SC_RSP | command_id::GET_QUEST_DATA_SC_RSP
-        ) {
-            return None;
-        }
+        // if !matches!(
+        //     command.command_id,
+        //     command_id::PLAYER_GET_TOKEN_SC_RSP | command_id::GET_QUEST_DATA_SC_RSP
+        // ) {
+        //     return None;
+        // }
 
-        if command.command_id == command_id::PLAYER_GET_TOKEN_SC_RSP {
-            let token_command = command.parse_proto::<PlayerGetTokenScRsp>().unwrap();
-            let seed = token_command.secret_key_seed;
-            info!(?seed, "setting new session key");
-            self.key = Some(new_key_from_seed(seed));
+        if let Some(Key::Dispatch(_)) = self.key {
+            if let Some(seed) = matches_player_get_token_sc_rsp(command.proto_data.clone()) {
+                self.key = Some(Key::Session(new_key_from_seed(seed)));
+                info!(?seed, "setting new session seed");
+            }
         }
 
         Some(command)
     }
+}
+
+pub fn matches_achievement_packet(game_command: &GameCommand) -> Option<Vec<Achievement>> {
+     return matches_get_quest_data_sc_rsp(game_command.proto_data.clone())
 }

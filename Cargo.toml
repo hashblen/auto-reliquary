@@ -1,6 +1,6 @@
 [package]
-name = "reliquary"
-version = "5.0.0"
+name = "auto-reliquary"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 
