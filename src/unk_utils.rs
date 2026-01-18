@@ -11,7 +11,7 @@ pub fn matches_player_get_token_sc_rsp(data: Vec<u8>) -> Option<u64> {
             let unknown_fields = d_msg.unknown_fields();
             for (_, field_data) in unknown_fields.iter() {
                 if let Varint(seed) = field_data {
-                    if seed > 1 << 54 {
+                    if seed > 1 << 32 {
                         possible_seeds.push(seed)
                     }
                 };
