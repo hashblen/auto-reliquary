@@ -8,6 +8,12 @@ pub fn parse_connection_packet(port_filter: &[u16], bytes: Vec<u8>) -> Option<Co
     let (udp, payload) = parse_udp(bytes)?;
     let direction = validate_ports(port_filter, udp)?;
 
+    // Too short to hold a control code, and not a KCP segment either.
+    if payload.len() < 4 {
+        trace!(len = payload.len(), "packet too short");
+        return None;
+    }
+
     if payload.len() <= 20 {
         let code = u32::from_be_bytes(payload[..4].try_into().unwrap());
         match code {

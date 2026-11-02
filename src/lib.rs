@@ -27,14 +27,18 @@
 //! let mut sniffer = GameSniffer::new();
 //! for packet in packets {
 //!     match sniffer.receive_packet(packet) {
-//!         Some(GamePacket::Connection(ConnectionPacket::Disconnected)) => {
+//!         Ok(Some(GamePacket::Connection(ConnectionPacket::Disconnected))) => {
 //!             println!("Disconnected!");
 //!             break;
 //!         }
-//!         Some(GamePacket::Commands(commands)) => {
+//!         Ok(Some(GamePacket::Commands(commands))) => {
 //!             for command in commands {
 //!                 println!("{:?}", command);
 //!             }
+//!         }
+//!         Err(error) => {
+//!             println!("{error}");
+//!             break;
 //!         }
 //!         _ => {}
 //!     }
@@ -51,7 +55,7 @@ use base64::Engine;
 use tracing::{info, info_span, instrument, trace, warn};
 
 use crate::connection::parse_connection_packet;
-use crate::crypto::{decrypt_command, lookup_initial_key, new_key_from_seed};
+use crate::crypto::{decrypt_command, lookup_initial_key, new_key_from_seed, HEAD_MAGIC};
 // use crate::gen::protos::PlayerGetTokenScRsp;
 use crate::kcp::KcpSniffer;
 use crate::unk_utils::{Achievement, matches_get_quest_data_sc_rsp, matches_player_get_token_sc_rsp};
@@ -174,12 +178,63 @@ pub enum Key {
     Session(Vec<u8>),
 }
 
+/// Why the sniffer gave up on a connection.
+///
+/// The sniffer has reset itself by the time one of these is returned, so whatever
+/// follows starts from scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SniffError {
+    /// None of the initial keys fit the connection's first packets. Either the
+    /// game has a new key, or the capture started after the login.
+    InitialKeyMissing {
+        /// The version the packets asked for, where the game has such a thing.
+        version: Option<u32>,
+        /// Whether the connection's handshake was captured. Without it the
+        /// capture started late, and any version is just noise.
+        saw_handshake: bool,
+    },
+    /// The initial key stopped fitting, but no session seed was ever seen.
+    SessionSeedMissing,
+    /// The session key stopped decrypting the traffic.
+    SessionKeyLost,
+}
+
+impl fmt::Display for SniffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InitialKeyMissing { version, saw_handshake } => write!(
+                f,
+                "no initial key found (version: {version:?}, handshake seen: {saw_handshake})"
+            ),
+            Self::SessionSeedMissing => write!(f, "no session seed found"),
+            Self::SessionKeyLost => write!(f, "the session key stopped working"),
+        }
+    }
+}
+
+impl std::error::Error for SniffError {}
+
+/// Which key the sniffer is decrypting with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    None,
+    Dispatch,
+    Session,
+}
+
+/// How many packets in a row may fail before a key is given up on. Packets the
+/// client sent just before the key changed can still be in flight, so one failure
+/// proves nothing.
+const MAX_KEY_FAILURES: u32 = 5;
+
 #[derive(Default)]
 pub struct GameSniffer {
     sent_kcp: Option<KcpSniffer>,
     recv_kcp: Option<KcpSniffer>,
     key: Option<Key>,
     initial_keys: HashMap<u32, Vec<u8>>,
+    saw_handshake: bool,
+    key_failures: u32,
 }
 
 impl GameSniffer {
@@ -192,30 +247,57 @@ impl GameSniffer {
         self
     }
 
+    /// Forget the current connection, keeping the keys the sniffer was set up with.
+    pub fn reset(&mut self) {
+        self.recv_kcp = None;
+        self.sent_kcp = None;
+        self.key = None;
+        self.saw_handshake = false;
+        self.key_failures = 0;
+    }
+
+    /// Which key the sniffer is decrypting with.
+    pub fn key_state(&self) -> KeyState {
+        match self.key {
+            None => KeyState::None,
+            Some(Key::Dispatch(_)) => KeyState::Dispatch,
+            Some(Key::Session(_)) => KeyState::Session,
+        }
+    }
+
     #[instrument(skip_all, fields(len = bytes.len()))]
-    pub fn receive_packet(&mut self, bytes: Vec<u8>) -> Option<GamePacket> {
-        let packet = parse_connection_packet(&PORTS, bytes)?;
+    pub fn receive_packet(&mut self, bytes: Vec<u8>) -> Result<Option<GamePacket>, SniffError> {
+        let result = self.process_packet(bytes);
+        if result.is_err() {
+            self.reset();
+        }
+        result
+    }
+
+    fn process_packet(&mut self, bytes: Vec<u8>) -> Result<Option<GamePacket>, SniffError> {
+        let Some(packet) = parse_connection_packet(&PORTS, bytes) else {
+            return Ok(None);
+        };
         match packet {
             ConnectionPacket::HandshakeRequested => {
                 info!("handshake requested, resetting state");
-                self.recv_kcp = None;
-                self.sent_kcp = None;
-                self.key = None;
-                Some(GamePacket::Connection(packet))
+                self.reset();
+                self.saw_handshake = true;
+                Ok(Some(GamePacket::Connection(packet)))
             }
             ConnectionPacket::HandshakeEstablished | ConnectionPacket::Disconnected => {
                 self.key = None;
-                Some(GamePacket::Connection(packet))
+                Ok(Some(GamePacket::Connection(packet)))
             }
 
             ConnectionPacket::SegmentData(direction, kcp_seg) => {
-                let commands = self.receive_kcp_segment(direction, &kcp_seg);
-                match commands {
-                    Some(commands) => Some(GamePacket::Commands(commands)),
-                    None => Some(GamePacket::Connection(ConnectionPacket::SegmentData(
+                let commands = self.receive_kcp_segment(direction, &kcp_seg)?;
+                Ok(Some(match commands {
+                    Some(commands) => GamePacket::Commands(commands),
+                    None => GamePacket::Connection(ConnectionPacket::SegmentData(
                         direction, kcp_seg,
-                    ))),
-                }
+                    )),
+                }))
             }
         }
     }
@@ -224,38 +306,62 @@ impl GameSniffer {
         &mut self,
         direction: PacketDirection,
         kcp_seg: &[u8],
-    ) -> Option<Vec<GameCommand>> {
+    ) -> Result<Option<Vec<GameCommand>>, SniffError> {
         let kcp = match direction {
             PacketDirection::Sent => &mut self.sent_kcp,
             PacketDirection::Received => &mut self.recv_kcp,
         };
 
         if kcp.is_none() {
-            let new_kcp = KcpSniffer::try_new(kcp_seg)?;
+            let Some(new_kcp) = KcpSniffer::try_new(kcp_seg) else {
+                return Ok(None);
+            };
             *kcp = Some(new_kcp);
         }
 
         if let Some(kcp) = kcp {
-            let commands = kcp
-                .receive_segments(kcp_seg)
-                .into_iter()
-                .filter_map(|data| self.receive_command(data))
-                .collect();
+            let mut commands = Vec::new();
+            for data in kcp.receive_segments(kcp_seg) {
+                commands.extend(self.receive_command(data)?);
+            }
 
-            return Some(commands);
+            return Ok(Some(commands));
         }
 
-        None
+        Ok(None)
+    }
+
+    /// Count a packet the current key can't decrypt, and give up on the connection
+    /// once too many have failed in a row.
+    fn key_failure<T>(&mut self, error: SniffError) -> Result<Option<T>, SniffError> {
+        self.key_failures += 1;
+        if self.key_failures >= MAX_KEY_FAILURES {
+            return Err(error);
+        }
+        Ok(None)
     }
 
     #[instrument(skip_all, fields(len = data.len()))]
-    fn receive_command(&mut self, mut data: Vec<u8>) -> Option<GameCommand> {
-        let key = match &self.key {
-            Some(k) => k,
-            None => {
-                self.key = Some(Key::Dispatch(lookup_initial_key(&self.initial_keys, &data)));
-                self.key.as_ref().unwrap()
+    fn receive_command(&mut self, mut data: Vec<u8>) -> Result<Option<GameCommand>, SniffError> {
+        let Some(head) = data.first_chunk::<4>().copied() else {
+            warn!(len = data.len(), "game command header incomplete");
+            return Ok(None);
+        };
+
+        if self.key.is_none() {
+            match lookup_initial_key(&self.initial_keys, &head) {
+                Ok(key) => self.key = Some(Key::Dispatch(key)),
+                Err(version) => {
+                    return self.key_failure(SniffError::InitialKeyMissing {
+                        version: Some(version),
+                        saw_handshake: self.saw_handshake,
+                    });
+                }
             }
+        }
+
+        let Some(key) = &self.key else {
+            return Ok(None);
         };
         let key_bytes = match key {
             Key::Dispatch(k) | Key::Session(k) => k,
@@ -263,7 +369,19 @@ impl GameSniffer {
 
         decrypt_command(key_bytes, &mut data);
 
-        let command = GameCommand::try_new(data)?;
+        if !data.starts_with(&HEAD_MAGIC.to_be_bytes()) {
+            warn!("command did not decrypt");
+            let error = match key {
+                Key::Dispatch(_) => SniffError::SessionSeedMissing,
+                Key::Session(_) => SniffError::SessionKeyLost,
+            };
+            return self.key_failure(error);
+        }
+        self.key_failures = 0;
+
+        let Some(command) = GameCommand::try_new(data) else {
+            return Ok(None);
+        };
 
         let span = info_span!("command", ?command);
         let _enter = span.enter();
@@ -285,10 +403,13 @@ impl GameSniffer {
             }
         }
 
-        Some(command)
+        Ok(Some(command))
     }
 }
 
 pub fn matches_achievement_packet(game_command: &GameCommand) -> Option<Vec<Achievement>> {
      return matches_get_quest_data_sc_rsp(game_command.proto_data.clone())
 }
+
+#[cfg(test)]
+mod tests;

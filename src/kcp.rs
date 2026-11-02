@@ -84,7 +84,7 @@ impl KcpSniffer {
     fn clock(&self) -> u32 {
         SystemTime::now()
             .duration_since(self.time_start)
-            .expect("time went backwards")
+            .unwrap_or_default()
             .as_millis() as u32
     }
 }
@@ -119,12 +119,22 @@ fn reformat_kcp_segments(data: &[u8]) -> Vec<u8> {
 
     let mut i = 0;
     while i < data.len() {
+        // Whatever is on these ports doesn't have to be a well-formed segment.
+        let Some(header) = data.get(i..i + 28) else {
+            warn!(len = data.len(), offset = i, "kcp segment header cut off");
+            break;
+        };
+        let content_len = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
+        if data.len() < i + 28 + content_len {
+            warn!(len = data.len(), offset = i, content_len, "kcp segment content cut off");
+            break;
+        }
+
         let conv_id = &data[i..i + 4];
 
         let _ = &data[i + 4..i + 8]; // skip
 
         let remaining_header = &data[i + 8..i + 28];
-        let content_len = u32::from_le_bytes(data[i + 24..i + 28].try_into().unwrap()) as usize;
         let content = &data[i + 28..i + 28 + content_len];
 
         for b in conv_id.iter().chain(remaining_header).chain(content) {
